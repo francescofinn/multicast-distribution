@@ -1,0 +1,14 @@
+Dataset presents the top songs currently trending for over 70 countries.
+- Identify the most popular genres of music in different countries over time.
+
+- Analyze the change in rankings of songs over time to identify trends and patterns.
+
+- Explore the relationship between the explicitness of songs and their popularity.
+
+- Analyze the relationship between song features (such as acousticness or instrumentalness) and their popularity.
+
+- Predict the future popularity of songs based on historical data and machine learning algorithms.
+
+- Compare the top songs in different countries to identify cultural music preferences.
+
+Credit: https://www.kaggle.com/datasets/anandshaw2001/top-spotify-songs-in-73-countries
