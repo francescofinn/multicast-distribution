@@ -5,6 +5,7 @@
 #include "multicast.h"
 #include "sender.h"
 
+
 uint32_t compute_checksum(const unsigned char *data, size_t length) {
     uint32_t checksum = 0;
     for (size_t i = 0; i < length; i++) {
@@ -20,12 +21,12 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    mcast_t *m = multicast_init("0.0.0.0", 5000, 5000); // Adjust IP and port later
+    mcast_t *m = multicast_init("239.0.0.1", 5000, 5000); // Adjust IP and port later
 
-    // Process each file 
-    for (int i = 0; i < argc; i++)
+    // Process each file BUG WAS HERE - argv[i] -> argv[i+1]
+    for (int i = 0; i < argc - 1; i++) // -1 because the first argc is just the program name
     {
-        FILE *fp = fopen(argv[i], "rb"); // Open in binary mode
+        FILE *fp = fopen(argv[i+1], "rb"); // Open in binary mode
         if (!fp) {
             perror("fopen");
             continue;

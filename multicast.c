@@ -5,7 +5,6 @@
 #include <string.h>
 #include <strings.h>
 #include "multicast.h"
-#include <asm-generic/socket.h>
 
 mcast_t *multicast_init(char *mcast_addr, int sport, int rport)
 {
