@@ -96,7 +96,6 @@ void try_reassemble_file(int file_id) {
         mkdir("received_files", 0777);
     #endif
 
-    //filename
     char filename[256];
     snprintf(filename, sizeof(filename), "received_files/file_%d", file_id);
     FILE *fp = fopen(filename, "wb");
@@ -131,9 +130,7 @@ void free_file_buffer(FileBuffer *fb) {
     free(fb);
 }
 
-// The main receiver loop.
 int main() {
-    // Initialize multicast receiver using an example multicast address and ports.
     mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
     multicast_setup_recv(m);
     printf("Receiver started. Listening for multicast data...\n");
@@ -141,7 +138,7 @@ int main() {
     while (1) {
         int ready = multicast_check_receive(m);
         if (ready > 0) {
-            // Allocate a buffer to hold a packet (header + data).
+            // Allocate a buffer for packet
             unsigned char packet[sizeof(chunk_header_t) + CHUNK_SIZE];
             int n = multicast_receive(m, packet, sizeof(packet));
             if (n < (int)sizeof(chunk_header_t)) {
@@ -152,7 +149,7 @@ int main() {
             memcpy(&header, packet, sizeof(chunk_header_t));
             unsigned char *data = packet + sizeof(chunk_header_t);
             
-            //checksum.
+            //checksum
             uint32_t chk = compute_checksum(data, header.data_size);
             if (chk != header.checksum) {
                 fprintf(stderr, "Checksum mismatch for file %d, chunk %d\n", header.file_id, header.seq_num);
@@ -161,7 +158,7 @@ int main() {
             
             store_chunk(header, data);
         }
-        // Small sleep to avoid busy-looping.
+        // Small sleep to avoid busy-looping
         usleep(10000);
     }
     
