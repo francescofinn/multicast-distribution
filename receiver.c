@@ -5,11 +5,10 @@
 #include <unistd.h>         
 #include <sys/stat.h>       
 #include "multicast.h"
-#include "sender.h"         // For chunk_header_t and CHUNK_SIZE
+#include "sender.h"       
 #include "receiver.h"
 
-
-#define MAX_FILES 10
+#define MAX_FILES 100
 
 FileBuffer *file_buffers[MAX_FILES] = {0};
 
@@ -21,7 +20,7 @@ uint32_t compute_checksum(const unsigned char *data, size_t length) {
     return checksum;
 }
 
-// get or create a FileBuffer for a given file_id
+// get or create a FileBuffer for a given file_id; open the output file for random-access writes
 FileBuffer *get_file_buffer(int file_id, int total_chunks) {
     if (file_id < 0 || file_id >= MAX_FILES) {
         fprintf(stderr, "File id %d out of bounds (max %d).\n", file_id, MAX_FILES);
@@ -38,9 +37,25 @@ FileBuffer *get_file_buffer(int file_id, int total_chunks) {
         fb->chunks_received = 0;
         fb->chunks = (unsigned char **)calloc(total_chunks, sizeof(unsigned char *));
         fb->chunk_sizes = (int *)calloc(total_chunks, sizeof(int));
-        fb->received = (int *)calloc(total_chunks, sizeof(int));
+        fb->received = (int *)calloc(total_chunks, sizeof(int)); // initially all 0
         if (!fb->chunks || !fb->chunk_sizes || !fb->received) {
             perror("calloc");
+            free(fb);
+            return NULL;
+        }
+        #ifdef _WIN32
+          _mkdir("received_files");
+        #else
+          mkdir("received_files", 0777);
+        #endif
+        char filename[256];
+        snprintf(filename, sizeof(filename), "received_files/file_%d", file_id);
+        fb->fp = fopen(filename, "wb+");  //random-access writing
+        if (!fb->fp) {
+            perror("fopen");
+            free(fb->chunks);
+            free(fb->chunk_sizes);
+            free(fb->received);
             free(fb);
             return NULL;
         }
@@ -49,78 +64,86 @@ FileBuffer *get_file_buffer(int file_id, int total_chunks) {
     return file_buffers[file_id];
 }
 
-// store chunk in correct file
+int get_pending_flush_count(FileBuffer *fb) {
+    int count = 0;
+    for (int i = 0; i < fb->total_chunks; i++) {
+        if (fb->received[i] == 1)
+            count++;
+    }
+    return count;
+}
+
+void flush_all_chunks(FileBuffer *fb) {
+    if (!fb || !fb->fp)
+        return;
+    int flushedCount = 0;
+    for (int i = 0; i < fb->total_chunks; i++) {
+        if (fb->received[i] == 1 && fb->chunks[i] != NULL) {
+            long offset = i * CHUNK_SIZE;
+            if (fseek(fb->fp, offset, SEEK_SET) != 0) {
+                perror("fseek");
+                continue;
+            }
+            if (fwrite(fb->chunks[i], 1, fb->chunk_sizes[i], fb->fp) != (size_t)fb->chunk_sizes[i]) {
+                perror("fwrite");
+                continue;
+            }
+            free(fb->chunks[i]);
+            fb->chunks[i] = NULL;
+            fb->received[i] = 2;  // mark as flushed
+            flushedCount++;
+        }
+    }
+    if (flushedCount > 0)
+        printf("Flushed %d non-contiguous chunks for file %d\n", flushedCount, fb->file_id);
+    fflush(fb->fp);
+}
+
+// store incoming chunk in RAM, flush to disk if cache is full
 void store_chunk(chunk_header_t header, unsigned char *data) {
     FileBuffer *fb = get_file_buffer(header.file_id, header.total_chunks);
     if (!fb)
         return;
-    // Make sur the chunk isn't already stored
+    // Validate sequence number
     if (header.seq_num < 0 || header.seq_num >= fb->total_chunks) {
         fprintf(stderr, "Invalid sequence number %d for file %d\n", header.seq_num, header.file_id);
         return;
     }
-    if (fb->received[header.seq_num] == 0) {
-        // copy chunk to buffer
-        fb->chunks[header.seq_num] = (unsigned char *)malloc(header.data_size);
-        if (!fb->chunks[header.seq_num]) {
-            perror("malloc");
-            return;
-        }
-        memcpy(fb->chunks[header.seq_num], data, header.data_size);
-        fb->chunk_sizes[header.seq_num] = header.data_size;
-        fb->received[header.seq_num] = 1;
-        fb->chunks_received++;
-        printf("Received file %d, chunk %d (%d/%d)\n", header.file_id, header.seq_num,
-               fb->chunks_received, fb->total_chunks);
-        
-        // All chunks are received
-        if (fb->chunks_received == fb->total_chunks) {
-            printf("All chunks for file %d received. Reassembling file...\n", header.file_id);
-            try_reassemble_file(header.file_id);
-        }
-    }
-}
-
-void try_reassemble_file(int file_id) {
-    if (file_id < 0 || file_id >= MAX_FILES)
-        return;
-    FileBuffer *fb = file_buffers[file_id];
-    if (!fb)
-        return;
-    if (fb->chunks_received != fb->total_chunks)
+    // If already received (flag 1 or 2) -> ignore duplicate retransmission
+    if (fb->received[header.seq_num] != 0)
         return;
     
-    #ifdef _WIN32
-        _mkdir("received_files");
-    #else
-        mkdir("received_files", 0777);
-    #endif
-
-    char filename[256];
-    snprintf(filename, sizeof(filename), "received_files/file_%d", file_id);
-    FILE *fp = fopen(filename, "wb");
-    if (!fp) {
-        perror("fopen");
+    fb->chunks[header.seq_num] = (unsigned char *)malloc(header.data_size);
+    if (!fb->chunks[header.seq_num]) {
+        perror("malloc");
         return;
     }
+    memcpy(fb->chunks[header.seq_num], data, header.data_size);
+    fb->chunk_sizes[header.seq_num] = header.data_size;
+    fb->received[header.seq_num] = 1;  // mark as buffered
+    fb->chunks_received++;
+    printf("Received file %d, chunk %d (%d/%d)\n", 
+           header.file_id, header.seq_num, fb->chunks_received, fb->total_chunks);
     
-    // write chunks in order.
-    for (int i = 0; i < fb->total_chunks; i++) {
-        if (fb->received[i])
-            fwrite(fb->chunks[i], 1, fb->chunk_sizes[i], fp);
+    if (get_pending_flush_count(fb) >= CACHE_LIMIT) {
+        flush_all_chunks(fb);
     }
-    fclose(fp);
-    printf("File %d reassembled and saved as %s\n", file_id, filename);
     
-    free_file_buffer(fb);
-    file_buffers[file_id] = NULL;
+    // If all chunks have been received, flush any remaining chunks and finalize the file
+    if (fb->chunks_received == fb->total_chunks) {
+        flush_all_chunks(fb);
+        printf("File %d fully received and flushed to disk.\n", fb->file_id);
+        fclose(fb->fp);
+        free_file_buffer(fb);
+        file_buffers[header.file_id] = NULL;
+    }
 }
 
 void free_file_buffer(FileBuffer *fb) {
     if (!fb)
         return;
     for (int i = 0; i < fb->total_chunks; i++) {
-        if (fb->received[i] && fb->chunks[i]) {
+        if ((fb->received[i] == 0 || fb->received[i] == 1) && fb->chunks[i]) {
             free(fb->chunks[i]);
         }
     }
@@ -138,18 +161,15 @@ int main() {
     while (1) {
         int ready = multicast_check_receive(m);
         if (ready > 0) {
-            // Allocate a buffer for packet
             unsigned char packet[sizeof(chunk_header_t) + CHUNK_SIZE];
             int n = multicast_receive(m, packet, sizeof(packet));
             if (n < (int)sizeof(chunk_header_t)) {
                 continue;
             }
-            // extract the header
             chunk_header_t header;
             memcpy(&header, packet, sizeof(chunk_header_t));
             unsigned char *data = packet + sizeof(chunk_header_t);
             
-            //checksum
             uint32_t chk = compute_checksum(data, header.data_size);
             if (chk != header.checksum) {
                 fprintf(stderr, "Checksum mismatch for file %d, chunk %d\n", header.file_id, header.seq_num);
@@ -158,7 +178,6 @@ int main() {
             
             store_chunk(header, data);
         }
-        // Small sleep to avoid busy-looping
         usleep(10000);
     }
     
