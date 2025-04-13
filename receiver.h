@@ -4,8 +4,6 @@
 #include <stdint.h>
 #include<pthread.h>
 
-#define CACHE_LIMIT 50
-
 typedef struct {
     int file_id;          
     int total_chunks;     
