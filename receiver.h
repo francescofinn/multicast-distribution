@@ -10,6 +10,7 @@ typedef struct {
     int total_chunks;     
     int chunks_received;  
     unsigned char **chunks;
+    int fin_sent;
     int *chunk_sizes;        
     // 0: not received, 1: received (in memory), 2: flushed to disk
     int *received;           

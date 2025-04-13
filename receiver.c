@@ -2,14 +2,16 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <unistd.h>         
-#include <sys/stat.h>       
+#include <unistd.h>
+#include <sys/stat.h>
+#include <time.h>
 #include "multicast.h"
-#include "sender.h"       
+#include "sender.h"
 #include "receiver.h"
 
 #define MAX_FILES 100
 
+// Global array to keep track of file buffers (one per file_id)
 FileBuffer *file_buffers[MAX_FILES] = {0};
 
 uint32_t compute_checksum(const unsigned char *data, size_t length) {
@@ -20,7 +22,7 @@ uint32_t compute_checksum(const unsigned char *data, size_t length) {
     return checksum;
 }
 
-// get or create a FileBuffer for a given file_id; open the output file for random-access writes
+// Get or create a FileBuffer for a given file_id; open the output file for random-access writes
 FileBuffer *get_file_buffer(int file_id, int total_chunks) {
     if (file_id < 0 || file_id >= MAX_FILES) {
         fprintf(stderr, "File id %d out of bounds (max %d).\n", file_id, MAX_FILES);
@@ -43,14 +45,14 @@ FileBuffer *get_file_buffer(int file_id, int total_chunks) {
             free(fb);
             return NULL;
         }
-        #ifdef _WIN32
-          _mkdir("received_files");
-        #else
-          mkdir("received_files", 0777);
-        #endif
+    #ifdef _WIN32
+        _mkdir("received_files");
+    #else
+        mkdir("received_files", 0777);
+    #endif
         char filename[256];
         snprintf(filename, sizeof(filename), "received_files/file_%d", file_id);
-        fb->fp = fopen(filename, "wb+");  //random-access writing
+        fb->fp = fopen(filename, "wb+");  // random-access writing
         if (!fb->fp) {
             perror("fopen");
             free(fb->chunks);
@@ -99,13 +101,13 @@ void flush_all_chunks(FileBuffer *fb) {
     fflush(fb->fp);
 }
 
-// store incoming chunk in RAM, flush to disk if cache is full
+// Store an incoming chunk in RAM, flush to disk if cache is full
 void store_chunk(chunk_header_t header, unsigned char *data) {
     FileBuffer *fb = get_file_buffer(header.file_id, header.total_chunks);
     if (!fb)
         return;
-    // Validate sequence number
-    if (header.seq_num < 0 || header.seq_num >= fb->total_chunks) {
+    // Validate sequence number (header.seq_num is unsigned, so no negative check necessary)
+    if (header.seq_num >= fb->total_chunks) {
         fprintf(stderr, "Invalid sequence number %d for file %d\n", header.seq_num, header.file_id);
         return;
     }
@@ -153,11 +155,28 @@ void free_file_buffer(FileBuffer *fb) {
     free(fb);
 }
 
+// Send individual NAK packets (one per missing chunk). Each NAK is 8 bytes: file_id and missing chunk seq number.
+void send_individual_naks(FileBuffer *fb, mcast_t *m) {
+    for (int i = 0; i < fb->total_chunks; i++) {
+        if (fb->received[i] == 0) { // missing chunk
+            uint32_t nak_packet[2];
+            nak_packet[0] = fb->file_id;
+            nak_packet[1] = i;
+            multicast_send(m, (unsigned char *)nak_packet, sizeof(nak_packet));
+            //printf("Sent NAK for file %u, missing chunk %d\n", fb->file_id, i);
+        }
+    }
+}
+
 int main() {
     mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
     multicast_setup_recv(m);
     printf("Receiver started. Listening for multicast data...\n");
-    
+
+    // Track the last time NAKs were sent.
+    time_t last_nak_time = time(NULL);
+    const int NAK_INTERVAL = 10;  // seconds
+
     while (1) {
         int ready = multicast_check_receive(m);
         if (ready > 0) {
@@ -178,7 +197,21 @@ int main() {
             
             store_chunk(header, data);
         }
-        usleep(10000);
+        usleep(10000);  // sleep for 10ms
+
+        // Every NAK_INTERVAL seconds, send individual NAKs for incomplete files.
+        time_t now = time(NULL);
+        if (now - last_nak_time >= NAK_INTERVAL) {
+            for (int id = 0; id < MAX_FILES; id++) {
+                if (file_buffers[id] != NULL) {
+                    FileBuffer *fb = file_buffers[id];
+                    if (fb->chunks_received < fb->total_chunks) {
+                        send_individual_naks(fb, m);
+                    }
+                }
+            }
+            last_nak_time = now;
+        }
     }
     
     multicast_destroy(m);
