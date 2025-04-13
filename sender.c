@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <string.h>
 #include <poll.h>
 #include <time.h>
@@ -8,6 +9,7 @@
 #include "sender.h"
 #include "common.h"
 
+#define SLEEP_TIME 1000 // Play with this ##################################********************************###################################
 
 uint32_t compute_checksum(const unsigned char *data, size_t length) {
     uint32_t checksum = 0;
@@ -105,41 +107,49 @@ int main(int argc, char *argv[]) {
         // Initially send all chunks over multicast
         for (int seq = 0; seq < total_chunks; seq++) {
             multicast_send(m, packets[seq], packet_sizes[seq]);
+            usleep(SLEEP_TIME);
         }
         printf("Sent all %d chunks for file %s. Waiting for NAKs...\n", total_chunks, argv[i+1]);
 
-        // Listen for NAKs for a total of 10 seconds
-        // Listen for NAKs for a total of 10 seconds
-        const int total_wait_sec = 100;
-        time_t start_time = time(NULL);
-        while ((time(NULL) - start_time) < total_wait_sec) {
-            int timeout_ms = 1000;  // Poll every 1 second
+        int *requested = calloc(total_chunks, sizeof(int));
+        if (!requested) {
+            fprintf(stderr, "Failed to allocate retransmission tracking array.\n");
+            exit(EXIT_FAILURE);
+        }
+        int request_count = 0;
+
+        
+        // Parameters for batch retransmission.
+        const int overall_wait_sec = 1000;  // overall maximum waiting time (seconds)
+        const int batch_capacity = 10000;      // number of requests to accumulate before sending batch retransmission
+        const int batch_wait_usec = 500;        // wait time between batches in seconds
+        time_t overall_start = time(NULL);
+        
+        // Accumulate individual NAK requests (each expected to be 8 bytes: file_id and seq).
+        while ((time(NULL) - overall_start) < overall_wait_sec) {
+            int timeout_ms = 500;  // poll in 0.5-second intervals
             int ret = poll(m->fds, m->nfds, timeout_ms);
             if (ret < 0) {
                 perror("poll");
                 break;
-            } else if (ret == 0) {
-                // No NAK received in this interval; keep waiting until overall time expires.
-                continue;
-            } else {
-                // There is incoming data: expect an individual NAK packet of 8 bytes.
-                unsigned char buffer[1500];
-                int bytes_received = recvfrom(m->sock, buffer, sizeof(buffer), 0, NULL, NULL);
+            } else if (ret > 0) {
+                // Received some data; expect an individual NAK.
+                unsigned char ctrl_buffer[1500];
+                int bytes_received = recvfrom(m->sock, ctrl_buffer, sizeof(ctrl_buffer), 0, NULL, NULL);
                 if (bytes_received < 0) {
                     perror("recvfrom");
                     continue;
                 }
-                // Expect exactly 8 bytes (2 x uint32_t)
+                // We expect exactly 8 bytes (2 x uint32_t).
                 if (bytes_received != (int)(2 * sizeof(uint32_t))) {
-                    //fprintf(stderr, "NAK packet size mismatch; expected %zu, got %d\n", 2 * sizeof(uint32_t), bytes_received);
+                    // Not a valid individual NAK message; ignore.
                     continue;
                 }
-                uint32_t file_id;
-                uint32_t seq;
-                memcpy(&file_id, buffer, sizeof(uint32_t));
-                memcpy(&seq, buffer + sizeof(uint32_t), sizeof(uint32_t));
-
-                // Verify that this NAK is for our current file.
+                uint32_t file_id, seq;
+                memcpy(&file_id, ctrl_buffer, sizeof(uint32_t));
+                memcpy(&seq, ctrl_buffer + sizeof(uint32_t), sizeof(uint32_t));
+                
+                // Only process NAKs for the current file.
                 if (file_id != (uint32_t)i) {
                     continue;
                 }
@@ -147,17 +157,50 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "Received NAK for invalid chunk %u (total_chunks=%d)\n", seq, total_chunks);
                     continue;
                 }
-                printf("Received NAK for file %u, chunk %u. Resending...\n", file_id, seq);
-                multicast_send(m, packets[seq], packet_sizes[seq]);
+                if (!requested[seq]) {
+                    requested[seq] = 1;
+                    request_count++;
+                    printf("Accumulated NAK for file %u, chunk %u (total accumulated: %d)\n", file_id, seq, request_count);
+                }
+            }
+            
+            // When we've accumulated batch_capacity requests, send a batch.
+            if (request_count >= batch_capacity) {
+                int batch_count = 0;
+                for (int j = 0; j < total_chunks; j++) {
+                    if (requested[j]) {
+                        multicast_send(m, packets[j], packet_sizes[j]);
+                        batch_count++;
+                        // Reset the flag for this chunk.
+                        requested[j] = 0;
+                        usleep(SLEEP_TIME);
+                    }
+                }
+                request_count = 0;
+                printf("Batch retransmitted %d chunks for file %s\n", batch_count, argv[i + 1]);
+                usleep(batch_wait_usec);  // Pause briefly between batches.
             }
         }
 
-        // Free stored packet memory for this file
+        // After overall_wait_sec is reached, send any remaining requested retransmissions.
+        int remaining = 0;
+        for (int j = 0; j < total_chunks; j++) {
+            if (requested[j]) {
+                multicast_send(m, packets[j], packet_sizes[j]);
+                remaining++;
+            }
+        }
+        if (remaining > 0) {
+            printf("Final batch retransmitted %d remaining chunks for file %s\n", remaining, argv[i + 1]);
+        }
+        free(requested);
+        
+        // Clean up the packet memory for this file.
         for (int k = 0; k < total_chunks; k++) {
             free(packets[k]);
         }
         free(packets);
-        free(packet_sizes);
+        free(packet_sizes);        
     }
 
     multicast_destroy(m);

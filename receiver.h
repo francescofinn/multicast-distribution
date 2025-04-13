@@ -2,8 +2,9 @@
 #define RECEIVER_H
 
 #include <stdint.h>
+#include<pthread.h>
 
-#define CACHE_LIMIT 10
+#define CACHE_LIMIT 50
 
 typedef struct {
     int file_id;          
@@ -15,6 +16,8 @@ typedef struct {
     // 0: not received, 1: received (in memory), 2: flushed to disk
     int *received;           
     FILE *fp;               // file pointer for output (random access)
+    pthread_mutex_t flush_mutex;  // to protect flush operations
+    int flush_in_progress;        // 0 = no flush in progress, 1 = flush running
 } FileBuffer;
 
 void store_chunk(chunk_header_t header, unsigned char *data);
