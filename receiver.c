@@ -21,29 +21,29 @@
 #define NAK_BATCH_SIZE 100   // Pause every 100 NAKs
 
 pthread_mutex_t global_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static char output_folder[256];
 
+#define FILE_LIST_CTRL   0xFFFFFFFF  // Marker for file list control message
+#define FILE_MISSING_REQ 0xFFFFFFFE  // Marker for file missing request
 
+mcast_t *g_m = NULL;
 
 typedef struct {
-    int file_id;                // File identifier
-    int total_chunks;           // Total expected chunks
-    int chunks_received;        // Count of received chunks
-    unsigned char **chunks;     // Array of chunk pointers
-    int *chunk_sizes;           // Array of chunk sizes
-    int *received;              // 0=not received, 1=buffered, 2=flushed
-    FILE *fp;                   // File pointer for random-access writes
-    pthread_mutex_t flush_mutex;// Protects flush operations
-    pthread_mutex_t fb_mutex;   // Protects modifications of this buffer
-    int flush_in_progress;      // 0 if no flush active, 1 if active
-    int naks_sent;              // 0 if NAKs not yet sent; 1 if sent for current missing set
-    time_t last_chunk_time;     // Time when the last chunk was received
-    int ref_count;              // Reference counter for in-flight processing
-    int complete;               // 0 if file still active, 1 if file complete.
+    int file_id;                
+    int total_chunks;           
+    int chunks_received;        
+    unsigned char **chunks;     
+    int *chunk_sizes;           
+    int *received;              
+    FILE *fp;                   
+    pthread_mutex_t flush_mutex;
+    pthread_mutex_t fb_mutex;   
+    int flush_in_progress;      
+    int naks_sent;              
+    time_t last_chunk_time;     
+    int ref_count;              
+    int complete;               
 } FileBuffer;
-
-
 
 FileBuffer *file_buffers[MAX_FILES] = {0};
 
@@ -151,8 +151,6 @@ void *flush_thread_func(void *arg) {
     return NULL;
 }
 
-// acquire_file_buffer(): Atomically obtain the file buffer and increment its ref_count.
-// If the file is complete (complete==1) or marked with sentinel, return NULL.
 FileBuffer *acquire_file_buffer(int file_id, int total_chunks) {
     pthread_mutex_lock(&global_fb_mutex);
     FileBuffer *fb = file_buffers[file_id];
@@ -169,13 +167,11 @@ FileBuffer *acquire_file_buffer(int file_id, int total_chunks) {
             pthread_mutex_unlock(&fb->fb_mutex);
         }
     }
-    // If still NULL, try to create a new buffer.
     if (fb == NULL) {
         if (file_buffers[file_id] == (FileBuffer *)-1) {
             pthread_mutex_unlock(&global_fb_mutex);
             return NULL;
         }
-        // Create new FileBuffer.
         fb = malloc(sizeof(FileBuffer));
         if (!fb) {
             perror("malloc");
@@ -188,7 +184,7 @@ FileBuffer *acquire_file_buffer(int file_id, int total_chunks) {
         fb->flush_in_progress = 0;
         fb->naks_sent = 0;
         fb->last_chunk_time = time(NULL);
-        fb->ref_count = 1;  // Set to 1 for the caller.
+        fb->ref_count = 1;
         fb->complete = 0;
         fb->chunks = calloc(total_chunks, sizeof(unsigned char *));
         fb->chunk_sizes = calloc(total_chunks, sizeof(int));
@@ -237,7 +233,6 @@ void free_file_buffer_and_mark_complete(int file_id, FileBuffer *fb) {
     pthread_mutex_unlock(&global_fb_mutex);
 }
 
-// store_chunk_v2(): Called with an acquired file buffer pointer.
 void store_chunk_v2(FileBuffer *fb, chunk_header_t header, unsigned char *data) {
     pthread_mutex_lock(&fb->fb_mutex);
     if (header.seq_num >= fb->total_chunks) {
@@ -279,7 +274,6 @@ void store_chunk_v2(FileBuffer *fb, chunk_header_t header, unsigned char *data) 
     }
     
     if (fb->chunks_received == fb->total_chunks) {
-        // Mark as complete.
         fb->complete = 1;
         while (fb->flush_in_progress) {
             pthread_mutex_unlock(&fb->fb_mutex);
@@ -288,7 +282,7 @@ void store_chunk_v2(FileBuffer *fb, chunk_header_t header, unsigned char *data) 
         }
         flush_all_chunks(fb);
         printf("File %d fully received and flushed to disk.\n", fb->file_id);
-        fb->ref_count--; // Decrement for the current packet.
+        fb->ref_count--;
         while (fb->ref_count > 0) {
             pthread_mutex_unlock(&fb->fb_mutex);
             usleep(10000);
@@ -307,6 +301,40 @@ void *worker_thread_func(void *arg) {
         packet_node *node = dequeue_packet(&recv_queue);
         if (!node)
             continue;
+
+        // --- New: Check for control packets.
+        if (node->packet_length >= (int)(2 * sizeof(uint32_t))) {
+            uint32_t ctrl_val;
+            memcpy(&ctrl_val, node->data, sizeof(uint32_t));
+            if (ctrl_val == FILE_LIST_CTRL) {
+                // This is a file list control message.
+                uint32_t count;
+                memcpy(&count, node->data + sizeof(uint32_t), sizeof(uint32_t));
+                printf("Received file list control message with %u files.\n", count);
+                for (uint32_t j = 0; j < count; j++) {
+                    uint32_t fid;
+                    memcpy(&fid, node->data + 2 * sizeof(uint32_t) + j * sizeof(uint32_t), sizeof(uint32_t));
+                    // Check if file fid is missing or incomplete.
+                    pthread_mutex_lock(&global_fb_mutex);
+                    FileBuffer *fb = (fid < MAX_FILES ? file_buffers[fid] : NULL);
+                    pthread_mutex_unlock(&global_fb_mutex);
+                    //if (fb == NULL || fb == (FileBuffer *)-1 || (fb && fb->complete != 1)) {
+
+                    if (fb == NULL) {
+                        printf("Requesting missing file %u\n", fid);
+                        uint32_t req[2];
+                        req[0] = fid;
+                        req[1] = FILE_MISSING_REQ;
+                        multicast_send(g_m, (unsigned char *)req, sizeof(req));
+                    }
+                }
+                free(node->data);
+                free(node);
+                continue;
+            }
+        }
+        // --- End control packet check.
+
         if (node->packet_length < (int)sizeof(chunk_header_t)) {
             free(node->data);
             free(node);
@@ -338,6 +366,8 @@ void *worker_thread_func(void *arg) {
 
 void *receiver_thread_func(void *arg) {
     mcast_t *m = (mcast_t *)arg;
+    // Save pointer for use in worker threads.
+    g_m = m;
     while (1) {
         unsigned char *packet = malloc(MAX_PACKET_SIZE);
         if (!packet) {
@@ -345,7 +375,7 @@ void *receiver_thread_func(void *arg) {
             continue;
         }
         int n = multicast_receive(m, packet, MAX_PACKET_SIZE);
-        if (n < (int)sizeof(chunk_header_t)) {
+        if (n < (int)(2 * sizeof(uint32_t))) {
             free(packet);
             continue;
         }
@@ -353,6 +383,7 @@ void *receiver_thread_func(void *arg) {
     }
     return NULL;
 }
+
 
 void send_missing_naks(mcast_t *m, FileBuffer *fb) {
     int sent_count = 0;
