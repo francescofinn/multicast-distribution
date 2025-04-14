@@ -25,6 +25,7 @@ static char output_folder[256];
 
 #define FILE_LIST_CTRL   0xFFFFFFFF  // Marker for file list control message
 #define FILE_MISSING_REQ 0xFFFFFFFE  // Marker for file missing request
+#define FILE_HASH_CTRL   0xFFFFFFFD  // Marker for file hash control message
 
 mcast_t *g_m = NULL;
 
@@ -107,6 +108,25 @@ uint32_t compute_checksum(const unsigned char *data, size_t length) {
     for (size_t i = 0; i < length; i++)
         checksum += data[i];
     return checksum;
+}
+
+// New helper: Compute file-level hash over a file on disk.
+uint32_t compute_file_hash(const char *filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("compute_file_hash fopen");
+        return 0;
+    }
+    uint32_t hash = 0;
+    unsigned char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        for (size_t i = 0; i < bytes; i++) {
+            hash += buffer[i];
+        }
+    }
+    fclose(fp);
+    return hash;
 }
 
 int get_pending_flush_count(FileBuffer *fb) {
@@ -301,12 +321,42 @@ void *worker_thread_func(void *arg) {
         packet_node *node = dequeue_packet(&recv_queue);
         if (!node)
             continue;
-
-        // --- New: Check for control packets.
         if (node->packet_length >= (int)(2 * sizeof(uint32_t))) {
             uint32_t ctrl_val;
             memcpy(&ctrl_val, node->data, sizeof(uint32_t));
-            if (ctrl_val == FILE_LIST_CTRL) {
+            // Check first for the file hash control packet
+            if (ctrl_val == FILE_HASH_CTRL) {
+                if (node->packet_length < (int)(3 * sizeof(uint32_t))) {
+                    free(node->data);
+                    free(node);
+                    continue;
+                }
+                uint32_t file_id, file_hash;
+                memcpy(&file_id, node->data + sizeof(uint32_t), sizeof(uint32_t));
+                memcpy(&file_hash, node->data + 2 * sizeof(uint32_t), sizeof(uint32_t));
+                char filename[512];
+                snprintf(filename, sizeof(filename), "%s/file_%u", output_folder, file_id);
+                
+                // Check if the file exists on disk before validating.
+                if (access(filename, F_OK) != 0) {
+                    printf("File %u not found on disk; skipping validation.\n", file_id);
+                    free(node->data);
+                    free(node);
+                    continue;
+                }
+                
+                uint32_t local_hash = compute_file_hash(filename);
+                if (local_hash != file_hash) {
+                    printf("File %u validation FAILED: expected hash %u, computed %u. Discarding file.\n", file_id, file_hash, local_hash);
+                    remove(filename);
+                } else {
+                    printf("File %u validated successfully (hash %u).\n", file_id, file_hash);
+                }
+                free(node->data);
+                free(node);
+                continue;
+            }
+            else if (ctrl_val == FILE_LIST_CTRL) {
                 // This is a file list control message.
                 uint32_t count;
                 memcpy(&count, node->data + sizeof(uint32_t), sizeof(uint32_t));
@@ -314,12 +364,10 @@ void *worker_thread_func(void *arg) {
                 for (uint32_t j = 0; j < count; j++) {
                     uint32_t fid;
                     memcpy(&fid, node->data + 2 * sizeof(uint32_t) + j * sizeof(uint32_t), sizeof(uint32_t));
-                    // Check if file fid is missing or incomplete.
+                    // Check if file fid is missing.
                     pthread_mutex_lock(&global_fb_mutex);
                     FileBuffer *fb = (fid < MAX_FILES ? file_buffers[fid] : NULL);
                     pthread_mutex_unlock(&global_fb_mutex);
-                    //if (fb == NULL || fb == (FileBuffer *)-1 || (fb && fb->complete != 1)) {
-
                     if (fb == NULL) {
                         printf("Requesting missing file %u\n", fid);
                         uint32_t req[2];
@@ -333,8 +381,6 @@ void *worker_thread_func(void *arg) {
                 continue;
             }
         }
-        // --- End control packet check.
-
         if (node->packet_length < (int)sizeof(chunk_header_t)) {
             free(node->data);
             free(node);
@@ -383,7 +429,6 @@ void *receiver_thread_func(void *arg) {
     }
     return NULL;
 }
-
 
 void send_missing_naks(mcast_t *m, FileBuffer *fb) {
     int sent_count = 0;
