@@ -20,6 +20,18 @@
 #define FILE_HASH_CTRL   0xFFFFFFFD  // Marker for file hash control message
 #define FILE_LIST_WAIT_SEC 2         // How long (in seconds) to wait after sending file list
 
+
+typedef struct {
+    unsigned long files_sent;         
+    unsigned long chunks_sent;         
+    unsigned long retransmitted_chunks; 
+    unsigned long batches_retransmitted;
+    unsigned long total_initial_bytes;  
+    unsigned long total_retrans_bytes;   
+} sender_stats_t;
+
+sender_stats_t stats = {0, 0, 0, 0, 0, 0};
+
 uint32_t compute_checksum(const unsigned char *data, size_t length) {
     uint32_t checksum = 0;
     for (size_t i = 0; i < length; i++) {
@@ -55,6 +67,7 @@ uint32_t compute_file_hash(const char *filename) {
     return hash;
 }
 
+// Modified resend_file now also updates the retransmission statistics
 void resend_file(const char *filename, uint32_t file_id, mcast_t *m) {
     FILE *fp = fopen(filename, "rb");
     if (!fp) {
@@ -98,15 +111,14 @@ void resend_file(const char *filename, uint32_t file_id, mcast_t *m) {
         packet_sizes[seq] = packet_size;
     }
     fclose(fp);
-    // Transmit all the chunks for the file again
+    // Transmit all the chunks for the file again, updating stats for each sent chunk and bytes
     for (int seq = 0; seq < total_chunks; seq++) {
         multicast_send(m, packets[seq], packet_sizes[seq]);
         usleep(SLEEP_TIME);
+        stats.retransmitted_chunks++;
+        stats.total_retrans_bytes += packet_sizes[seq];
     }
     printf("Resent all %d chunks for file %s (file_id=%u)\n", total_chunks, filename, file_id);
-    for (int i = 0; i < total_chunks; i++) {
-        free(packets[i]);
-    }
     free(packets);
     free(packet_sizes);
 }
@@ -116,6 +128,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s file1 [file2 ...]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
+
+    // Record start time for transmission rate
+    time_t start_time = time(NULL);
+
     mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
     multicast_setup_recv(m);
     // Store file names and file count for retransmission requests
@@ -169,6 +185,8 @@ int main(int argc, char *argv[]) {
         for (int seq = 0; seq < total_chunks; seq++) {
             multicast_send(m, packets[seq], packet_sizes[seq]);
             usleep(SLEEP_TIME);
+            stats.chunks_sent++;
+            stats.total_initial_bytes += packet_sizes[seq];
         }
         printf("Sent all %d chunks for file %s. Waiting for NAKs...\n", total_chunks, file_names[i]);
         int *requested = calloc(total_chunks, sizeof(int));
@@ -225,9 +243,12 @@ int main(int argc, char *argv[]) {
                         batch_count++;
                         requested[j] = 0;
                         usleep(SLEEP_TIME);
+                        stats.retransmitted_chunks++;
+                        stats.total_retrans_bytes += packet_sizes[j];
                     }
                 }
                 request_count = 0;
+                stats.batches_retransmitted++;
                 printf("Batch retransmitted %d chunks for file %s\n", batch_count, file_names[i]);
                 usleep(BATCH_WAIT_USEC);
                 last_nak_time = time(NULL);
@@ -239,12 +260,13 @@ int main(int argc, char *argv[]) {
             if (requested[j]) {
                 multicast_send(m, packets[j], packet_sizes[j]);
                 remaining++;
+                stats.retransmitted_chunks++;
+                stats.total_retrans_bytes += packet_sizes[j];
             }
         }
         if (remaining > 0)
             printf("Final batch retransmitted %d remaining chunks for file %s\n", remaining, file_names[i]);
         free(requested);
-
         // Send file list control message as before
         uint32_t count = i + 1;
         size_t list_msg_size = sizeof(uint32_t) + sizeof(uint32_t) + count * sizeof(uint32_t);
@@ -261,7 +283,7 @@ int main(int argc, char *argv[]) {
         multicast_send(m, (unsigned char *)list_msg, list_msg_size);
         printf("Sent file list control message for files 0 to %u\n", i);
         free(list_msg);
-
+        // Send file hash control message
         uint32_t file_hash = compute_file_hash(file_names[i]);
         uint32_t hash_packet[3];
         hash_packet[0] = FILE_HASH_CTRL; // marker for file hash control
@@ -269,7 +291,7 @@ int main(int argc, char *argv[]) {
         hash_packet[2] = file_hash;       // computed hash value
         multicast_send(m, (unsigned char *)hash_packet, sizeof(hash_packet));
         printf("Sent file hash control message for file %s (file_id=%u, hash=%u)\n", file_names[i], i, file_hash);
-
+        // Process missing-file requests (with retransmissions and rehashing)
         time_t file_list_start = time(NULL);
         int *resend_done = calloc(num_files, sizeof(int));
         while ((time(NULL) - file_list_start) < FILE_LIST_WAIT_SEC) {
@@ -286,11 +308,7 @@ int main(int argc, char *argv[]) {
                         if (!resend_done[req_file_id]) {
                             printf("Received file request for file %u, retransmitting\n", req_file_id);
                             resend_file(file_names[req_file_id], req_file_id, m);
-                            // After retransmission, compute the file's hash again:
                             uint32_t file_hash = compute_file_hash(file_names[req_file_id]);
-                            //   word0: FILE_HASH_CTRL marker
-                            //   word1: file id
-                            //   word2: file hash
                             uint32_t hash_packet[3];
                             hash_packet[0] = FILE_HASH_CTRL;
                             hash_packet[1] = req_file_id;
@@ -300,7 +318,6 @@ int main(int argc, char *argv[]) {
                             resend_done[req_file_id] = 1;
                         }
                     }
-                    
                 }
             }
         }
@@ -311,7 +328,29 @@ int main(int argc, char *argv[]) {
         }
         free(packets);
         free(packet_sizes);
+        stats.files_sent++;
     }
     multicast_destroy(m);
+    
+    time_t end_time = time(NULL);
+    double elapsed = difftime(end_time, start_time);
+    unsigned long total_bytes = stats.total_initial_bytes + stats.total_retrans_bytes;
+    
+    printf("\n--- Transmission Statistics ---\n");
+    printf("Total files sent:            %lu\n", stats.files_sent);
+    printf("Total initial chunks sent:   %lu\n", stats.chunks_sent);
+    printf("Total retransmitted chunks:  %lu\n", stats.retransmitted_chunks);
+    printf("Total retransmission batches:%lu\n", stats.batches_retransmitted);
+    printf("Total initial bytes sent:    %lu\n", stats.total_initial_bytes);
+    printf("Total retransmitted bytes:   %lu\n", stats.total_retrans_bytes);
+    printf("Total bytes sent:            %lu\n", total_bytes);
+    if (elapsed > 0) {
+        printf("Elapsed time:                %.2f seconds\n", elapsed);
+        printf("Average transmission rate:   %.2f bytes/second\n", total_bytes / elapsed);
+    } else {
+        printf("Elapsed time:                less than one second\n");
+    }
+    printf("-----------------------------------\n");
+    
     return 0;
 }
